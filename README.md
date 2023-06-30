@@ -11,6 +11,8 @@ Include as normal in all other files.
 
 ## Example
 ```c
+#define ECS_IMPL
+#include "ecs.h"
 #include <stdio.h>
 
 typedef struct { int x, y; } ivec2;
