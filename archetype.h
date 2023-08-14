@@ -14,12 +14,6 @@
 typedef uint64_t ecs_id_t;
 typedef struct ecs_t ecs_t;
 
-typedef struct {
-    void *components;
-    ecs_id_t *entities;
-    size_t count;
-} ecs_view_t;
-
 ///////////////////////////////////////////////////////////////////////////////
 /// Functions
 
@@ -27,7 +21,7 @@ ecs_t      *ecs_create                      (int entity_count_hint);
 void        ecs_delete                      (ecs_t *ecs);
 
 #define     ecs_register(ecs, fn, ...)      _ecs_register((ecs), (fn), #__VA_ARGS__)
-ecs_id_t   _ecs_register                    (ecs_t *ecs, void (*fn)(ecs_view_t *), char const *components);
+ecs_id_t   _ecs_register                    (ecs_t *ecs, void (*fn)(void *, ecs_id_t *, size_t), char const *components);
 
 ecs_id_t    ecs_spawn                       (ecs_t *ecs);
 void        ecs_despawn                     (ecs_t *ecs, ecs_id_t entity_id);
@@ -40,8 +34,8 @@ void      *_ecs_get                         (ecs_t *ecs, ecs_id_t entity_id, cha
 void       _ecs_rem                         (ecs_t *ecs, ecs_id_t entity_id, char const *component_name);
 
 void        ecs_run                         (ecs_t *ecs, ecs_id_t system_id);
-#define     ecs_field(view, T)              _ecs_field((view), #T)
-void      *_ecs_field                       (ecs_view_t const *view, char const *component_name);
+#define     ecs_field(components, T)        _ecs_field((components), #T)
+void      *_ecs_field                       (void const *components, char const *component_name);
 
 ///////////////////////////////////////////////////////////////////////////////
 ///                                                                         ///
@@ -355,6 +349,8 @@ static _ecs_archetype_t _ecs_archetype_make(uint64_t id) {
     };
 }
 
+// Initializes `curr` with the correct component arrays.
+// Works going forward (e.g. [A, B] -> [A, B, C]) and backward (e.g. [A, B, C] -> [A, B])
 static void _ecs_archetype_qualify(_ecs_archetype_t *curr, _ecs_archetype_t *next, uint64_t component_id, size_t component_stride, int set) {
     _ecs_map_foreach(uint64_t key, uint64_t *val, curr->edges, {
         _ecs_map_set(&next->edges, key, &(uint64_t){next->id ^ key});
@@ -375,11 +371,12 @@ static void _ecs_archetype_qualify(_ecs_archetype_t *curr, _ecs_archetype_t *nex
     }
 }
 
+// Gets or creates a new archetype by either combining or removing `curr_archetype_id` and `component_id`
 static uint64_t _ecs_archetype_obtain(uint64_t curr_archetype_id, uint64_t component_id, size_t component_stride, _ecs_map_t *archetypes, int set) {
-    // This will find the next archetype when adding OR removing a component
+    // This will find the next archetype when adding or removing a component
     //  - If adding a component, curr_archetype_id will not have component_id "in" it yet, so they will combine
     //  - If removing a component, curr_archetype_id will have component_id "in" it, so it will "take" component_id out
-    // Even if the same components were added in differentity orders, no archetype will be duplicated
+    // Since XOR is transitive, no archetype will be duplicated even if the same components were added in different orders
     uint64_t next_archetype_id = curr_archetype_id ^ component_id;
 
     _ecs_archetype_t *get = _ecs_map_get(archetypes, next_archetype_id);
@@ -394,6 +391,7 @@ static uint64_t _ecs_archetype_obtain(uint64_t curr_archetype_id, uint64_t compo
     return next.id;
 }
 
+// Moves an entity and its components between archetypes
 static size_t _ecs_archetype_transfer(uint64_t curr_archetype_id, uint64_t next_archetype_id, size_t curr_row, _ecs_map_t *archetypes) {
     _ecs_archetype_t *curr = _ecs_map_get(archetypes, curr_archetype_id);
     _ecs_archetype_t *next = _ecs_map_get(archetypes, next_archetype_id);
@@ -463,11 +461,11 @@ void ecs_delete(ecs_t *ecs) {
     free(ecs);
 }
 
-ecs_id_t _ecs_register(ecs_t *ecs, void (*fn)(ecs_view_t *), char const *components) {
+ecs_id_t _ecs_register(ecs_t *ecs, void (*fn)(void *, ecs_id_t *, size_t), char const *components) {
     char *dup = strdup(components);
     ecs_id_t system_id = ecs->root_archetype_id;
     for (char const *tok = strtok(dup, ", "); tok; tok = strtok(NULL, ", "))
-        system_id ^= _ecs_str_hash(tok, 0);
+        system_id ^= _ecs_str_hash(tok, 0); // Combine the component hashes so system_id would be equal to the corresponding archetype_id
     free(dup);
 
     _ecs_map_set(&ecs->systems, system_id, &fn);
@@ -477,6 +475,7 @@ ecs_id_t _ecs_register(ecs_t *ecs, void (*fn)(ecs_view_t *), char const *compone
 ecs_id_t ecs_spawn(ecs_t *ecs) {
     ecs_id_t entity_id = 0;
 
+    // Creates or recycles an entity. See https://skypjack.github.io/2019-05-06-ecs-baf-part-3/
     if (ecs->next_idx < UINT32_MAX) {
         ecs_id_t tmp = _ecs_arr_get_as(&ecs->ids, ecs->next_idx, ecs_id_t);
         uint32_t idx = ecs->next_idx;
@@ -500,12 +499,14 @@ void ecs_despawn(ecs_t *ecs, ecs_id_t entity_id) {
     _ecs_entity_t *entity = _ecs_map_get(&ecs->entities, hash);
     if (!entity) return;
 
+    // Transfer the entity to the root component to remove the components then pop the most recently added entity from root (which will be this entity)
     _ecs_archetype_transfer(entity->archetype_id, ecs->root_archetype_id, entity->row, &ecs->archetypes);
     _ecs_archetype_t *root = _ecs_map_get(&ecs->archetypes, ecs->root_archetype_id);
     _ecs_arr_pop(&root->entities);
 
     _ecs_map_rem(&ecs->entities, hash);
 
+    // Increment this index's version
     _ecs_arr_set(&ecs->ids, _ecs_id_idx(entity_id), &(ecs_id_t){_ecs_id_make(_ecs_id_ver(entity_id) + 1, _ecs_id_idx(entity_id))});
     ecs->next_idx = _ecs_id_idx(entity_id);
 }
@@ -549,11 +550,11 @@ void _ecs_rem(ecs_t *ecs, ecs_id_t entity_id, char const *component_name) {
     entity->row = _ecs_archetype_transfer(curr_id, entity->archetype_id, entity->row, &ecs->archetypes);
 }
 
-static void _ecs_run(ecs_t *ecs, _ecs_archetype_t *archetype, void (*fn)(ecs_view_t *), int num_component_types) {
+static void _ecs_run(ecs_t *ecs, _ecs_archetype_t *archetype, void (*fn)(void *, ecs_id_t *, size_t), int num_component_types) {
     if (!archetype || archetype->components.len < num_component_types) return;
 
     if (archetype->entities.len)
-        fn(&(ecs_view_t){.components = &archetype->components, .entities = (ecs_id_t *)archetype->entities.data, .count = archetype->entities.len});
+        fn(&archetype->components, (ecs_id_t *)archetype->entities.data, archetype->entities.len);
 
     _ecs_map_foreachv(uint64_t *edge, archetype->edges, {
         _ecs_run(ecs, _ecs_map_get(&ecs->archetypes, *edge), fn, archetype->components.len);
@@ -561,14 +562,14 @@ static void _ecs_run(ecs_t *ecs, _ecs_archetype_t *archetype, void (*fn)(ecs_vie
 }
 
 void ecs_run(ecs_t *ecs, ecs_id_t system_id) {
-    void (**fn)(ecs_view_t *) = _ecs_map_get(&ecs->systems, system_id);
+    void (**fn)(void *, ecs_id_t *, size_t) = _ecs_map_get(&ecs->systems, system_id);
     if (!fn) return;
 
     _ecs_run(ecs, _ecs_map_get(&ecs->archetypes, system_id), *fn, 0);
 }
 
-void *_ecs_field(ecs_view_t const *view, char const *component_name) {
-    _ecs_arr_t *arr = _ecs_map_get(view->components, _ecs_str_hash(component_name, 0));
+void *_ecs_field(void const *components, char const *component_name) {
+    _ecs_arr_t *arr = _ecs_map_get(components, _ecs_str_hash(component_name, 0));
     return arr ? arr->data : NULL;
 }
 
